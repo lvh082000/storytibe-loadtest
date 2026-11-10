@@ -6,6 +6,8 @@
 // images from storage.ricvina.vn (not behind Cloudflare) + CORS preflight + POST view. Moving to
 // the next chapter is client-side: preflight + POST view + prefetch of the newly visible link.
 // JS/CSS are served by Cloudflare's cache (HIT) and are skipped here.
+// Since ric-novel-web b2fccba (2026-11-10) only the logo, the current series and the
+// previous/next chapter prefetch (PREFETCH=nav, default); PREFETCH=all replays the old profile.
 //
 // Modes (env MODE): smoke | readers | spike. One GitHub Actions job = one k6 process = one
 // egress IP; per-IP limits of ric-api (view 120/min, unlock 30/min) are respected by spreading
@@ -35,11 +37,18 @@ const UA =
   'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) ' +
   'Chrome/130.0 Mobile Safari/537.36 storytibe-loadtest/1.0'
 
-const KINDS = ['page', 'me', 'rsc', 'img', 'preflight', 'view', 'unlock']
+const KINDS = ['page', 'me', 'rsc', 'img', 'preflight', 'view', 'unlock', 'guard']
 const CLASSES = ['ok', '4xx', '429', '503', '5xx', 'err']
 const STAGES = MODE === 'spike' ? ['spike'] : ['ramp', 'hold']
 const STATIC_PAGES = ['/privacy-policy', '/terms-of-service', '/disclaimer']
+// PREFETCH=all replays every internal link (the site before 2026-11-10 b2fccba). Default: only
+// the links that still prefetch — logo "/", current series, previous/next chapter.
+const PREFETCH = E.PREFETCH || 'nav'
 const NO_PREFETCH = /^\/(login|register|library|forgot-password|reset-password|verify-email)\b/
+// Self-abort: every job probes the shared API; GUARD_MAX bad probes (not 200 or > 1 s) => k6
+// stops itself and still writes its summary (cancelling the GitHub run loses it).
+const GUARD_MAX = toInt(E.GUARD_MAX, 8)
+const guardBad = new Counter('guard_bad')
 
 const counters = {}
 KINDS.forEach((k) => {
@@ -48,7 +57,9 @@ KINDS.forEach((k) => {
   })
 })
 
-const thresholds = {}
+const thresholds = {
+  guard_bad: [{ threshold: `count<${GUARD_MAX}`, abortOnFail: true, delayAbortEval: '10s' }],
+}
 KINDS.forEach((k) => {
   STAGES.forEach((s) => {
     // Always passes; declaring it makes k6 report this tag combination in the summary.
@@ -56,9 +67,20 @@ KINDS.forEach((k) => {
   })
 })
 
+const guardScenario = {
+  executor: 'constant-arrival-rate',
+  exec: 'guard',
+  rate: 12,
+  timeUnit: '1m',
+  duration: MODE === 'spike' ? '5m' : `${durationMs(RAMP) / 1000 + durationMs(HOLD) / 1000 + 20}s`,
+  preAllocatedVUs: 2,
+  maxVUs: 4,
+}
+
 const scenarios =
   MODE === 'spike'
     ? {
+        guard: guardScenario,
         spike: {
           executor: 'ramping-arrival-rate',
           exec: 'spikeReader',
@@ -75,6 +97,7 @@ const scenarios =
         },
       }
     : {
+        guard: guardScenario,
         readers: {
           executor: 'ramping-vus',
           exec: 'reader',
@@ -214,8 +237,27 @@ function maybeUnlock(chapter, stage) {
   apiPost('unlock', chapter, 'unlock', stage)
 }
 
+function prevOf(chapters, chapter) {
+  for (let i = 0; i < chapters.length; i++) {
+    const c = chapters[i]
+    if (c.series === chapter.series && c.n === chapter.n - 1) return c
+  }
+  return null
+}
+
+/** Links the browser prefetches on a chapter page, in on-screen order (top of page first). */
+function prefetchLinks(html, path, chapter, chapters) {
+  if (PREFETCH === 'all') return extractLinks(html, path)
+  const out = ['/', `/series/${chapter.series}`]
+  const prev = prevOf(chapters, chapter)
+  const next = nextOf(chapters, chapter)
+  if (prev) out.push(`/${prev.slug}`)
+  if (next) out.push(`/${next.slug}`)
+  return out
+}
+
 /** Full page load of a chapter. Returns false when the HTML did not load. */
-function land(chapter, seen) {
+function land(chapter, seen, chapters) {
   const stage = stageNow()
   const path = `/${chapter.slug}`
   const page = http.get(
@@ -233,7 +275,7 @@ function land(chapter, seen) {
   count('page', page)
   if (page.status !== 200 || typeof page.body !== 'string') return false
 
-  const links = extractLinks(page.body, path)
+  const links = prefetchLinks(page.body, path, chapter, chapters)
   const imgs = extractImages(page.body).filter((u) => !seen[u])
   imgs.forEach((u) => {
     seen[u] = true
@@ -327,7 +369,7 @@ export function reader(data) {
   const chapters = data.chapters
   const seen = {}
   let chapter = chapters[Math.floor(Math.random() * chapters.length)]
-  if (!land(chapter, seen)) {
+  if (!land(chapter, seen, chapters)) {
     sleep(rand(5, 15))
     return
   }
@@ -345,10 +387,20 @@ export function reader(data) {
 export function spikeReader(data) {
   const chapters = data.chapters
   const chapter = chapters.filter((c) => c.slug === SPIKE_CHAPTER)[0] || chapters[0]
-  if (!land(chapter, {})) return
+  if (!land(chapter, {}, chapters)) return
   sleep(rand(60, 120))
   const next = nextOf(chapters, chapter)
   if (next && Math.random() < 0.5) navigate(next, nextOf(chapters, next))
+}
+
+/** Health probe of the API shared with other tenants; enough bad probes abort this job. */
+export function guard() {
+  const res = http.get(`${API}/health`, {
+    tags: { kind: 'guard', stage: stageNow(), name: 'guard' },
+    timeout: '10s',
+  })
+  count('guard', res)
+  if (res.status !== 200 || res.timings.duration > 1000) guardBad.add(1)
 }
 
 export function handleSummary(data) {
@@ -371,7 +423,7 @@ export function handleSummary(data) {
     if (key.indexOf('http_req_duration{') === 0) out.durations[key.slice(18, -1)] = m[key].values
     if (key.indexOf('st_') === 0) out.statuses[key.slice(3)] = m[key].values.count
   })
-  ;['http_reqs', 'data_received', 'data_sent', 'iterations', 'dropped_iterations', 'vus_max'].forEach(
+  ;['http_reqs', 'data_received', 'data_sent', 'iterations', 'dropped_iterations', 'vus_max', 'guard_bad'].forEach(
     (k) => {
       if (m[k]) out.totals[k] = m[k].values
     },
