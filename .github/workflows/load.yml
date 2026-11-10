@@ -1,0 +1,113 @@
+name: load
+
+# Manual only. Each matrix job is one k6 process on its own runner (= its own egress IP).
+# All jobs wait for the same START_AT so the load starts together.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'smoke | readers | spike'
+        type: choice
+        options: [smoke, readers, spike]
+        default: smoke
+      jobs:
+        description: 'Parallel jobs (max 20)'
+        type: string
+        default: '1'
+      vus:
+        description: 'Readers per job (smoke/readers)'
+        type: string
+        default: '5'
+      ramp:
+        description: 'Ramp-up duration, e.g. 10m'
+        type: string
+        default: '1m'
+      hold:
+        description: 'Hold duration, e.g. 10m'
+        type: string
+        default: '1m'
+      read_min:
+        description: 'Min seconds reading one chapter'
+        type: string
+        default: '120'
+      read_max:
+        description: 'Max seconds reading one chapter'
+        type: string
+        default: '240'
+      spike_per_min:
+        description: 'Spike: new readers per minute per job'
+        type: string
+        default: '100'
+      spike_chapter:
+        description: 'Spike: chapter slug everyone opens'
+        type: string
+        default: 'chapter-1-the-deed-in-the-envelope'
+      start_delay:
+        description: 'Seconds to wait so every job starts together'
+        type: string
+        default: '150'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: load
+  cancel-in-progress: false
+
+env:
+  K6_VERSION: '1.0.0'
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.p.outputs.matrix }}
+      start_at: ${{ steps.p.outputs.start_at }}
+    steps:
+      - id: p
+        env:
+          JOBS: ${{ inputs.jobs }}
+          DELAY: ${{ inputs.start_delay }}
+        run: |
+          n=$(( JOBS > 20 ? 20 : (JOBS < 1 ? 1 : JOBS) ))
+          echo "matrix=[$(seq -s, 1 "$n")]" >> "$GITHUB_OUTPUT"
+          echo "start_at=$(( $(date +%s) + DELAY ))" >> "$GITHUB_OUTPUT"
+
+  load:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        job: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install k6
+        run: |
+          curl -fsSL "https://github.com/grafana/k6/releases/download/v${K6_VERSION}/k6-v${K6_VERSION}-linux-amd64.tar.gz" | tar -xz
+          sudo mv "k6-v${K6_VERSION}-linux-amd64/k6" /usr/local/bin/k6
+          k6 version
+
+      - name: Run k6
+        env:
+          MODE: ${{ inputs.mode }}
+          JOB: ${{ matrix.job }}
+          VUS: ${{ inputs.vus }}
+          RAMP: ${{ inputs.ramp }}
+          HOLD: ${{ inputs.hold }}
+          READ_MIN: ${{ inputs.read_min }}
+          READ_MAX: ${{ inputs.read_max }}
+          SPIKE_PER_MIN: ${{ inputs.spike_per_min }}
+          SPIKE_CHAPTER: ${{ inputs.spike_chapter }}
+          START_AT: ${{ needs.plan.outputs.start_at }}
+        run: k6 run --quiet --no-color k6/novel-reader.js
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: summary-${{ matrix.job }}
+          path: summary.json
+          if-no-files-found: warn
